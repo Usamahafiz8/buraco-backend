@@ -2,7 +2,6 @@ import { BadRequestException, ForbiddenException, Injectable, Logger, NotFoundEx
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { GameHost, GameMode, GameStatus, GameVariant, MoveType, Prisma, RoomStatus } from '@prisma/client';
 
-const INACTIVE_FAST_AUTOPLAY_SECONDS = 5;
 // Forfeit a player after this many FULLY auto-played turns. Counted once per turn
 // (see handleTurnTimeout) and accumulated per-player across the whole match — a new
 // round/hand does NOT reset it; only a manual move by that player clears it.
@@ -63,6 +62,23 @@ export interface SeventyFiveRuleState {
    * the turn ends without reaching `requirement`. Always empty once satisfied or cancelled.
    */
   pendingCardIds: string[];
+}
+
+/**
+ * What a 75-rule rollback actually did — emitted verbatim inside `lastMove` on both the
+ * manual `CANCEL_MELDS` and the `DISCARD` that auto-cancels, and to EVERY viewer, not just
+ * the actor. The client animates exactly `returnedCardIds` from that seat's meld area back
+ * to its hand; without the ids it had to diff meld rows that were already gone, so the
+ * cards just vanished on the opponent's phone. Before/after pairs let a client show the
+ * penalty as a transition (75 → 95) and detect a payload it has already applied.
+ */
+export interface SeventyFiveRollback {
+  playerId: string;
+  returnedCardIds: string[];
+  seventyFiveRequiredBefore: number;
+  seventyFiveRequiredAfter: number;
+  seventyFiveTurnPointsBefore: number;
+  seventyFiveTurnPointsAfter: number;
 }
 
 export interface TossEntry {
@@ -142,15 +158,17 @@ export interface GameState {
   matchScores: Record<number, number>;
   winnerTeam?: number;
   /**
-   * Cadence counter — consecutive auto-played turns per player.
-   * Resets to 0 on any manual action OR bare reconnect.
-   * When ≥ 1 at the start of a turn, the server uses INACTIVE_FAST_AUTOPLAY_SECONDS
-   * instead of the full turnDuration before auto-playing.
+   * Cadence counter — consecutive auto-played turns per player, shown to clients as
+   * `missedTurns`. Resets to 0 ONLY on a manual move by that player (see processMove) —
+   * NOT on a bare reconnect or a round transition, so a player who reconnects and then
+   * goes AFK again resumes counting from where they left off instead of starting over.
+   * Kept as a separate field from forfeitMissedTurns for the client's benefit (a
+   * "this-streak" number vs. a "whole match" tally); the two currently move in lockstep.
    */
   consecutiveMissedTurns?: Record<string, number>;
   /**
-   * Forfeit counter — consecutive auto-played turns per player.
-   * Resets to 0 ONLY on a manual move (not bare reconnect).
+   * Forfeit counter — consecutive auto-played turns per player, shown to clients as
+   * `awayTurns`. Resets to 0 ONLY on a manual move (not bare reconnect).
    * Reaches 12 → forfeit, same semantics as the original single counter.
    */
   forfeitMissedTurns?: Record<string, number>;
@@ -288,8 +306,7 @@ export class GameEngineService implements OnModuleInit {
           if (state.turnPhase === 'ROUND_ENDED') return;
 
           const currentPlayerId = state.turnOrder[state.currentTurnIndex];
-          const cadence = (state.consecutiveMissedTurns ?? {})[currentPlayerId] ?? 0;
-          const effectiveTimeout = cadence >= 1 ? INACTIVE_FAST_AUTOPLAY_SECONDS : state.turnDuration;
+          const effectiveTimeout = this.effectiveTurnSeconds(state, currentPlayerId);
           if (Date.now() - state.turnStartedAt > effectiveTimeout * 1000) {
             // Idempotency lock. This cron runs EVERY_5_SECONDS over ALL games via
             // Promise.all, and @Cron does not prevent a slow run from overlapping the
@@ -514,6 +531,11 @@ export class GameEngineService implements OnModuleInit {
         missedTurns: 0,
         awayTurns:   0,
         isAway:      false,
+        melds:       [] as Meld[],
+        seventyFiveActive:     false,
+        seventyFiveSatisfied:  true,
+        seventyFiveRequired:   75,
+        seventyFiveTurnPoints: 0,
       })),
       myHand:               [] as Card[],
       myMelds:              [] as Meld[],
@@ -522,6 +544,9 @@ export class GameEngineService implements OnModuleInit {
       currentTurnIndex:     0,
       turnStartedAt:        0,
       turnDuration:         0,
+      turnDurationBase:     0,
+      turnFastAutoplay:     false,
+      turnEndsAt:           0,
       round:                0,
       scores:               {} as Record<number, number>,
       moveCount:            0,
@@ -541,6 +566,42 @@ export class GameEngineService implements OnModuleInit {
       awayAfterTurns:       AWAY_AFTER_AUTO_TURNS,
       forfeitAfterTurns:    FORFEIT_AFTER_AUTO_TURNS,
       turnTimeRemaining:    0,
+    };
+  }
+
+  /**
+   * Seconds the CURRENT turn actually lasts before the server auto-plays it.
+   *
+   * Always `state.turnDuration` — the table's own configured turn length — whether the
+   * current player is present or has already had turns auto-played. Previously this
+   * dropped to a flat 5s once a player had missed a turn, regardless of what the table was
+   * set to, which both raced a table's own (possibly longer or shorter) turn length and
+   * made the "AI takes over" countdown appear to reset to a fixed 5s instead of scaling
+   * with the room. An absent player's turns are still timed out on schedule and still climb
+   * toward the 12-turn forfeit — they just do so at the table's own pace, same as anyone
+   * else's turn. Kept as a single definition — used by the cron that fires the timeout, by
+   * markPlayerReconnected, and by the client view — so the number the phones count down is
+   * by construction the same number the server acts on.
+   */
+  private effectiveTurnSeconds(state: GameState, _playerId: string): number {
+    return state.turnDuration;
+  }
+
+  /**
+   * One player's authoritative 75-rule block, in the shape the client renders a
+   * "YOUR 75-RULE 40/75" / "OPP 75-RULE 0/95" label from.
+   *
+   * Emitted for EVERY player (see buildClientView), not just the viewer: a phone cannot
+   * label the opponent's 75-rule state from viewer-scoped fields, which is why the opponent
+   * seat stayed on "0/75" (or showed nothing at all) after the actor's requirement moved.
+   */
+  private seventyFiveViewFor(state: GameState, playerId: string) {
+    const rule = state.seventyFiveRule?.[playerId];
+    return {
+      seventyFiveActive:     rule?.active ?? false,
+      seventyFiveSatisfied:  rule?.satisfied ?? true,
+      seventyFiveRequired:   rule?.requirement ?? 75,
+      seventyFiveTurnPoints: this.seventyFiveTurnPoints(state, playerId),
     };
   }
 
@@ -580,12 +641,24 @@ export class GameEngineService implements OnModuleInit {
       // ── Away-from-phone counters ────────────────────────────────────────────
       // Live on the server (the AI plays these turns), so a reconnecting client can show
       // "opponent has missed N turns / forfeits in M" without tracking any of it locally.
-      // missedTurns is the per-round cadence counter (reset by a reconnect); awayTurns is
-      // the whole-match forfeit tally, cleared ONLY by a manual move.
+      // Both are whole-match tallies now, cleared ONLY by a manual move (see processMove) —
+      // neither is reset by a bare reconnect or a new round, so a player who keeps
+      // disconnecting and reconnecting without ever actually playing keeps climbing toward
+      // the 12-turn forfeit instead of getting a free reset each time they pop back in.
       missedTurns: (state.consecutiveMissedTurns ?? {})[p.userId] ?? 0,
       awayTurns:   (state.forfeitMissedTurns ?? {})[p.userId] ?? 0,
       isAway:      this.isPlayerAway(state, p.userId),
+      // This seat's melds, always derived from the live `state.melds` on THIS call — so a
+      // rollback (cancel / auto-cancel) can never leave a returned card visible here on the
+      // opponent's phone while the actor's own payload has already dropped it.
+      melds:       (state.melds[p.userId] || []).map(m => ({ ...m, teamId: p.teamId })),
+      // Authoritative per-seat 75-rule state — both phones label both seats from this.
+      ...this.seventyFiveViewFor(state, p.userId),
     }));
+
+    // Effective window for the turn in progress — always the table's own configured turn
+    // length (see effectiveTurnSeconds), whether or not the current player is absent.
+    const effectiveTurnDuration = this.effectiveTurnSeconds(state, currentPlayerId);
 
     return {
       gameId:               state.gameId,
@@ -608,7 +681,18 @@ export class GameEngineService implements OnModuleInit {
       turnOrder:            state.turnOrder,
       currentTurnIndex:     state.currentTurnIndex,
       turnStartedAt:        state.turnStartedAt,
-      turnDuration:         state.turnDuration,
+      // The window the SERVER will actually act on — always the table's own configured
+      // turn length now (see effectiveTurnSeconds); an absent player no longer shortens it.
+      turnDuration:         effectiveTurnDuration,
+      // Same value as turnDuration today. Kept as a separate field (rather than removed)
+      // for client compatibility — anything reading "the table's rule rather than this
+      // turn's countdown" can keep using this name.
+      turnDurationBase:     state.turnDuration,
+      // Always false now that an absent player's turn is timed at the table's own length
+      // rather than a shortened one. Kept for client compatibility.
+      turnFastAutoplay:     effectiveTurnDuration !== state.turnDuration,
+      // Absolute deadline, so a client can drive its countdown without accumulating drift.
+      turnEndsAt:           state.turnStartedAt + effectiveTurnDuration * 1000,
       round:                state.round,
       scores:               state.scores,
       moveCount:            state.moveCount,
@@ -624,20 +708,18 @@ export class GameEngineService implements OnModuleInit {
       winnerTeamId:         state.winnerTeam != null ? String(state.winnerTeam) : null,
       lastRoundScores:      state.lastRoundScores ?? [],
       // Requesting player's own 75-rule progress — e.g. "40/75" — active/required/satisfied
-      // plus the running total of this turn's not-yet-satisfied meld plays.
-      seventyFiveActive:    state.seventyFiveRule?.[requestingUserId]?.active ?? false,
-      seventyFiveSatisfied: state.seventyFiveRule?.[requestingUserId]?.satisfied ?? true,
-      seventyFiveRequired:  state.seventyFiveRule?.[requestingUserId]?.requirement ?? 75,
-      seventyFiveTurnPoints: this.seventyFiveTurnPoints(state, requestingUserId),
+      // plus the running total of this turn's not-yet-satisfied meld plays. Kept as root
+      // fields for existing clients; the same values are also in players[] for EVERY seat,
+      // which is what an opponent label has to be built from.
+      ...this.seventyFiveViewFor(state, requestingUserId),
       // Thresholds the counters above are measured against, so the client can render
       // "3 / 12" without hardcoding server rules.
       awayAfterTurns:       AWAY_AFTER_AUTO_TURNS,
       forfeitAfterTurns:    FORFEIT_AFTER_AUTO_TURNS,
-      turnTimeRemaining: (() => {
-        const cadence = (state.consecutiveMissedTurns ?? {})[currentPlayerId] ?? 0;
-        const effective = cadence >= 1 ? INACTIVE_FAST_AUTOPLAY_SECONDS : state.turnDuration;
-        return Math.max(0, effective - Math.floor((Date.now() - state.turnStartedAt) / 1000));
-      })(),
+      turnTimeRemaining: Math.max(
+        0,
+        effectiveTurnDuration - Math.floor((Date.now() - state.turnStartedAt) / 1000),
+      ),
     };
   }
 
@@ -655,8 +737,20 @@ export class GameEngineService implements OnModuleInit {
 
     // Any successful manual move resets both the cadence counter and the forfeit counter.
     if (!state.consecutiveMissedTurns) state.consecutiveMissedTurns = {};
-    state.consecutiveMissedTurns[playerId] = 0;
     if (!state.forfeitMissedTurns) state.forfeitMissedTurns = {};
+    // TEMP DIAGNOSTIC (awayTurns-reset investigation): only an actual manual move should
+    // ever clear a nonzero streak — logging every occurrence lets us confirm from server
+    // logs that a reported reset really did come through here, on this move, and not from
+    // some other write racing the same Redis key. Remove once the investigation is closed.
+    const priorForfeit = state.forfeitMissedTurns[playerId] ?? 0;
+    const priorConsecutive = state.consecutiveMissedTurns[playerId] ?? 0;
+    if (priorForfeit > 0 || priorConsecutive > 0) {
+      this.logger.warn(
+        `[afk-counter] processMove(${move.type}) by ${playerId} in game ${gameId} cleared an ` +
+        `active AFK streak: forfeitMissedTurns ${priorForfeit}->0, consecutiveMissedTurns ${priorConsecutive}->0`,
+      );
+    }
+    state.consecutiveMissedTurns[playerId] = 0;
     state.forfeitMissedTurns[playerId] = 0;
 
     const turnPhase: TurnPhase = state.turnPhase ?? 'MUST_DRAW';
@@ -664,6 +758,8 @@ export class GameEngineService implements OnModuleInit {
     const playerTeamId = state.players.find(p => p.userId === playerId)?.teamId ?? 1;
     const teamPlayerIds = state.players.filter(p => p.teamId === playerTeamId).map(p => p.userId);
     let result: any = {};
+    /** Set by the DISCARD case when that discard also auto-cancelled a short 75-rule attempt. */
+    let autoCancelRollback: SeventyFiveRollback | null = null;
 
     switch (move.type) {
 
@@ -1053,7 +1149,10 @@ export class GameEngineService implements OnModuleInit {
 
         // 75-rule: discarding ends the turn, so a still-open opening attempt is resolved
         // now rather than carrying into next turn — see autoResolveSeventyFiveRuleOnTurnEnd.
-        this.autoResolveSeventyFiveRuleOnTurnEnd(state, playerId);
+        // Non-null only when this discard actually rolled an attempt back; the caller
+        // forwards it as autoCancelled75 + returnedCardIds so the client can tell a plain
+        // discard from one that also returned cards and moved the requirement.
+        autoCancelRollback = this.autoResolveSeventyFiveRuleOnTurnEnd(state, playerId);
 
         const cardId = move.cardIds?.[0];
         if (!cardId) throw new BadRequestException('No card specified for discard');
@@ -1163,6 +1262,13 @@ export class GameEngineService implements OnModuleInit {
       }
     }
 
+    // A discard that also rolled a short 75-rule attempt back reports both, so the client
+    // never has to infer the escalation from a requirement that silently changed.
+    if (autoCancelRollback) {
+      result.autoCancelled75 = true;
+      Object.assign(result, autoCancelRollback);
+    }
+
     state.moveCount++;
     await this.redis.setJson(this.stateKey(gameId), state, 86400);
     await this.prisma.gameMove.create({
@@ -1172,6 +1278,7 @@ export class GameEngineService implements OnModuleInit {
     return {
       state:            this.buildClientView(state, playerId),
       result,
+      rollback:         autoCancelRollback,
       teamId:           state.players.find(p => p.userId === playerId)?.teamId,
       nextTurnPlayerId: state.turnOrder[state.currentTurnIndex],
     };
@@ -1559,12 +1666,17 @@ export class GameEngineService implements OnModuleInit {
    * `requirement` by 20, and clears the pending list. Deletes any meld left with zero cards;
    * a meld that keeps some cards (a merge onto an older permanent meld) survives with just
    * the non-pending ones. Does NOT touch `satisfied` — the caller only reaches here when it's
-   * already false. Returns the returned cards (for the caller's result payload); a no-op
-   * (returns []) when nothing is pending.
+   * already false. Returns a SeventyFiveRollback describing exactly what moved (the caller
+   * puts it straight into `lastMove`); null when nothing was pending.
    */
-  private cancelPendingMelds(state: GameState, playerId: string): Card[] {
+  private cancelPendingMelds(state: GameState, playerId: string): SeventyFiveRollback | null {
     const rule = state.seventyFiveRule?.[playerId];
-    if (!rule?.pendingCardIds?.length) return [];
+    if (!rule?.pendingCardIds?.length) return null;
+
+    // Snapshot before the board is touched — seventyFiveTurnPoints reads the melds we are
+    // about to strip, so it must be sampled first.
+    const requiredBefore   = rule.requirement;
+    const turnPointsBefore = this.seventyFiveTurnPoints(state, playerId);
 
     const pendingIds = new Set(rule.pendingCardIds);
     const returned: Card[] = [];
@@ -1592,7 +1704,17 @@ export class GameEngineService implements OnModuleInit {
     state.hands[playerId].push(...returned);
     rule.requirement += 20;
     rule.pendingCardIds = [];
-    return returned;
+
+    return {
+      playerId,
+      returnedCardIds: returned.map(c => c.id),
+      seventyFiveRequiredBefore:   requiredBefore,
+      seventyFiveRequiredAfter:    rule.requirement,
+      seventyFiveTurnPointsBefore: turnPointsBefore,
+      // Always 0 — pendingCardIds was just emptied. Sent explicitly so a client never has
+      // to assume the reset.
+      seventyFiveTurnPointsAfter:  this.seventyFiveTurnPoints(state, playerId),
+    };
   }
 
   /**
@@ -1604,11 +1726,15 @@ export class GameEngineService implements OnModuleInit {
    * whenever there's nothing pending (rule inactive, already satisfied, or the player never
    * attempted a meld this turn — matching the pre-existing behaviour of not penalising a
    * turn where no meld was attempted at all).
+   *
+   * Returns the rollback descriptor so the caller can advertise it on the DISCARD as
+   * `autoCancelled75` + `returnedCardIds`, or null when it was a no-op — which is also the
+   * signal that the discard was an ordinary one with no penalty attached.
    */
-  private autoResolveSeventyFiveRuleOnTurnEnd(state: GameState, playerId: string): void {
+  private autoResolveSeventyFiveRuleOnTurnEnd(state: GameState, playerId: string): SeventyFiveRollback | null {
     const rule = state.seventyFiveRule?.[playerId];
-    if (!rule?.active || rule.satisfied || !rule.pendingCardIds?.length) return;
-    this.cancelPendingMelds(state, playerId);
+    if (!rule?.active || rule.satisfied || !rule.pendingCardIds?.length) return null;
+    return this.cancelPendingMelds(state, playerId);
   }
 
   /**
@@ -1632,13 +1758,27 @@ export class GameEngineService implements OnModuleInit {
       throw new BadRequestException('NOTHING_TO_CANCEL');
     }
 
-    const returned = this.cancelPendingMelds(state, playerId);
+    const rollback = this.cancelPendingMelds(state, playerId)!;
 
     // A deliberate action, same as any other manual move — proves the player is present.
     if (!state.consecutiveMissedTurns) state.consecutiveMissedTurns = {};
-    state.consecutiveMissedTurns[playerId] = 0;
     if (!state.forfeitMissedTurns) state.forfeitMissedTurns = {};
+    // TEMP DIAGNOSTIC (awayTurns-reset investigation) — see processMove for rationale.
+    const cancelPriorForfeit = state.forfeitMissedTurns[playerId] ?? 0;
+    const cancelPriorConsecutive = state.consecutiveMissedTurns[playerId] ?? 0;
+    if (cancelPriorForfeit > 0 || cancelPriorConsecutive > 0) {
+      this.logger.warn(
+        `[afk-counter] cancelMelds by ${playerId} in game ${gameId} cleared an active AFK streak: ` +
+        `forfeitMissedTurns ${cancelPriorForfeit}->0, consecutiveMissedTurns ${cancelPriorConsecutive}->0`,
+      );
+    }
+    state.consecutiveMissedTurns[playerId] = 0;
     state.forfeitMissedTurns[playerId] = 0;
+
+    // Counts as a move so the payload carries a fresh sequence number — see `seq` in
+    // buildClientView's callers: a client that has already applied this rollback can drop
+    // an echoed copy instead of tearing down and rebuilding the meld rows again.
+    state.moveCount++;
 
     await this.redis.setJson(this.stateKey(gameId), state, 86400);
 
@@ -1646,10 +1786,11 @@ export class GameEngineService implements OnModuleInit {
       state: this.buildClientView(state, playerId),
       result: {
         cancelled:        true,
-        returnedCardIds:  returned.map(c => c.id),
         handCount:        state.hands[playerId].length,
         requirement:      rule.requirement,
+        ...rollback,
       },
+      rollback,
       teamId: state.players.find(p => p.userId === playerId)?.teamId,
     };
   }
@@ -1693,26 +1834,14 @@ export class GameEngineService implements OnModuleInit {
     state.turnPhase   = 'MUST_DRAW';
     state.turnStartedAt = Date.now();
     state.toss        = null; // no toss animation for round ≥ 2
-    // Only the per-round cadence counter resets here. forfeitMissedTurns tracks a
-    // player's cumulative AI-auto-played turns across the WHOLE match (it resets
-    // solely on a manual move, see processMove) — wiping it on every round transition
-    // meant an AFK player's 12-move forfeit threshold could never be reached in a
-    // multi-round match, since a round almost always ends before 12 is hit within it.
-    //
-    // Reset cadence for CONNECTED players (they get a fresh full turn window next round),
-    // but PRESERVE it for players who are still disconnected. Otherwise a disconnected
-    // player's first turn of every new round falls back from the 5s fast-autoplay path to
-    // the full turnDuration (e.g. 30s), so reaching the 12-turn forfeit could take many
-    // minutes across a multi-round match — the "12 AI moves but the game won't end" report
-    // (#12). Keeping cadence for the disconnected keeps them on the 5s path so the forfeit
-    // is reached in bounded time. A reconnect zeroes this for that player (markPlayerReconnected).
-    const carriedCadence: Record<string, number> = {};
-    for (const p of state.players) {
-      if (p.isConnected === false) {
-        carriedCadence[p.userId] = (state.consecutiveMissedTurns ?? {})[p.userId] ?? 1;
-      }
-    }
-    state.consecutiveMissedTurns = carriedCadence;
+    // Neither miss counter is touched on a round transition. forfeitMissedTurns tracks a
+    // player's cumulative AI-auto-played turns across the WHOLE match (it resets solely on
+    // a manual move, see processMove) — wiping it on every round transition meant an AFK
+    // player's 12-move forfeit threshold could never be reached in a multi-round match,
+    // since a round almost always ends before 12 is hit within it. consecutiveMissedTurns
+    // now follows the exact same rule (see markPlayerReconnected and its own doc comment on
+    // GameState) so an AFK player's streak keeps climbing across round boundaries too,
+    // instead of quietly resetting every time a new hand is dealt.
 
     // Re-evaluate 75-rule for every player using the updated cumulative match scores
     state.seventyFiveRule = Object.fromEntries(state.players.map(p => {
@@ -2217,22 +2346,33 @@ export class GameEngineService implements OnModuleInit {
     const player = state.players.find(p => p.userId === userId);
     if (!player) return;
     player.isConnected = true;
+    // TEMP DIAGNOSTIC (awayTurns-reset investigation): this call never mutates either
+    // counter (see comment below) — logging what it READ, next to handleTurnTimeout's own
+    // read/write log, lets the two be lined up by timestamp on a real repro to see whether
+    // this read-modify-write cycle raced one from an in-flight auto-play turn and, by
+    // writing back its own (stale) unmodified copy of the counters, clobbered a concurrent
+    // increment. Remove once the investigation is closed.
+    this.logger.log(
+      `[afk-counter] markPlayerReconnected ${userId} in game ${gameId}: observed ` +
+      `forfeitMissedTurns=${state.forfeitMissedTurns?.[userId] ?? 0}, ` +
+      `consecutiveMissedTurns=${state.consecutiveMissedTurns?.[userId] ?? 0} (this call does not change them)`,
+    );
     // If the timer already expired while this player was away and it is still their
     // turn, give them a fresh full-duration window so the next cron tick does not
     // immediately auto-play on their behalf. Otherwise leave turnStartedAt untouched
-    // so the remaining time is resumed rather than reset. Must check using the cadence
-    // that was actually in effect while they were away, before it gets zeroed below.
+    // so the remaining time is resumed rather than reset.
     if (state.status === GameStatus.IN_PROGRESS && state.turnOrder[state.currentTurnIndex] === userId) {
-      const cadence = (state.consecutiveMissedTurns ?? {})[userId] ?? 0;
-      const effectiveTimeout = cadence >= 1 ? INACTIVE_FAST_AUTOPLAY_SECONDS : state.turnDuration;
+      const effectiveTimeout = this.effectiveTurnSeconds(state, userId);
       const expired = Date.now() - state.turnStartedAt > effectiveTimeout * 1000;
       if (expired) {
         state.turnStartedAt = Date.now();
       }
     }
-    // Stop AI takeover the moment the player is back — reset their auto-play counter.
-    if (!state.consecutiveMissedTurns) state.consecutiveMissedTurns = {};
-    state.consecutiveMissedTurns[userId] = 0;
+    // Deliberately does NOT touch consecutiveMissedTurns/forfeitMissedTurns. A bare
+    // reconnect means the player is back on the socket, not that they made a move — it
+    // should not erase how many turns the AI has already played for them. If they go AFK
+    // again right after reconnecting, both counters resume from where they left off
+    // instead of restarting at 0 (only an actual move, see processMove, clears them).
     await this.redis.setJson(this.stateKey(gameId), state, 86400);
   }
 
@@ -2369,7 +2509,18 @@ export class GameEngineService implements OnModuleInit {
     const priorMissed = state.consecutiveMissedTurns[playerId] ?? 0;
     state.consecutiveMissedTurns[playerId] = priorMissed + 1;
     if (!state.forfeitMissedTurns) state.forfeitMissedTurns = {};
-    state.forfeitMissedTurns[playerId] = (state.forfeitMissedTurns[playerId] ?? 0) + 1;
+    const priorForfeit = state.forfeitMissedTurns[playerId] ?? 0;
+    state.forfeitMissedTurns[playerId] = priorForfeit + 1;
+    // TEMP DIAGNOSTIC (awayTurns-reset investigation): this function reads state once up
+    // front, then stays in memory across several awaits (Prisma writes, the per-meld
+    // pacing delay) before its own setJson persists it — the widest window of any writer
+    // on this key. Logging the read-time value here, next to markPlayerReconnected's own
+    // read-time log, lets us line the two up by timestamp and see whether a reconnect's
+    // write actually landed AFTER this one and clobbered it back down. Remove once closed.
+    this.logger.log(
+      `[afk-counter] handleTurnTimeout auto-played for ${playerId} in game ${gameId}: ` +
+      `forfeitMissedTurns ${priorForfeit}->${priorForfeit + 1}, consecutiveMissedTurns ${priorMissed}->${priorMissed + 1}`,
+    );
     // Smart play activates on the second and subsequent misses (priorMissed ≥ 1).
     const useSmartPlay = priorMissed >= 1;
 
@@ -2451,8 +2602,13 @@ export class GameEngineService implements OnModuleInit {
 
     // 75-rule: this turn is about to end (discard or a no-legal-discard advance below) —
     // resolve any still-open opening attempt now rather than let it carry into this
-    // player's next turn. See autoResolveSeventyFiveRuleOnTurnEnd.
-    this.autoResolveSeventyFiveRuleOnTurnEnd(state, playerId);
+    // player's next turn. See autoResolveSeventyFiveRuleOnTurnEnd. An AFK/timeout turn
+    // carries the SAME autoCancelled75 + returnedCardIds payload as a manual discard, so
+    // the client animates the return identically whoever triggered the turn end.
+    const autoCancelRollback = this.autoResolveSeventyFiveRuleOnTurnEnd(state, playerId);
+    const seventyFiveFields = autoCancelRollback
+      ? { autoCancelled75: true, ...autoCancelRollback }
+      : {};
 
     const discardIdx = useSmartPlay
       ? this.aiPickDiscardIndex(state, playerId, hand)
@@ -2464,9 +2620,12 @@ export class GameEngineService implements OnModuleInit {
       state.turnStartedAt    = Date.now();
       state.turnPhase        = 'MUST_DRAW';
       await this.redis.setJson(this.stateKey(gameId), state, 86400);
-      if (!drawnCard) {
+      // Emit when there was no draw to piggy-back on, AND whenever a 75-rule rollback
+      // happened: the draw's own emit went out BEFORE the rollback, so skipping here would
+      // leave the returned cards sitting on every phone's table until the next event.
+      if (!drawnCard || autoCancelRollback) {
         await this.socketService.emitPerPlayer(`game:${gameId}`, 'game:state_updated', async (uid) => ({
-          lastMove: { type: 'TIMEOUT_ADVANCE', playerId, isAuto: true },
+          lastMove: { type: 'TIMEOUT_ADVANCE', playerId, isAuto: true, ...seventyFiveFields },
           ...this.buildClientView(state, uid),
         }));
       }
@@ -2485,7 +2644,7 @@ export class GameEngineService implements OnModuleInit {
         await this.prisma.gameMove.create({
           data: { gameId, playerId, turnNumber: state.moveCount, moveType: MoveType.DISCARD, cardData: { auto: true, card: discardedCard as any, potAwarded: potAward }, isValid: true },
         });
-        const discardMove = { type: 'TIMEOUT_DISCARD', playerId, cardId: discardedCard.id, potAwarded: potAward, isAuto: true };
+        const discardMove = { type: 'TIMEOUT_DISCARD', playerId, cardId: discardedCard.id, potAwarded: potAward, isAuto: true, ...seventyFiveFields };
         this.socketService.emitToRoom(`game:${gameId}`, 'game:move_played', discardMove);
         await this.socketService.emitPerPlayer(`game:${gameId}`, 'game:state_updated', async (uid) => ({
           lastMove: discardMove,
@@ -2501,7 +2660,7 @@ export class GameEngineService implements OnModuleInit {
       await this.prisma.gameMove.create({
         data: { gameId, playerId, turnNumber: state.moveCount, moveType: MoveType.DISCARD, cardData: { auto: true, card: discardedCard as any }, isValid: true },
       });
-      const discardMove = { type: 'TIMEOUT_DISCARD', playerId, cardId: discardedCard.id, isAuto: true };
+      const discardMove = { type: 'TIMEOUT_DISCARD', playerId, cardId: discardedCard.id, isAuto: true, ...seventyFiveFields };
       this.socketService.emitToRoom(`game:${gameId}`, 'game:move_played', discardMove);
       await this.socketService.emitPerPlayer(`game:${gameId}`, 'game:state_updated', async (uid) => ({
         lastMove: discardMove,
@@ -2523,7 +2682,7 @@ export class GameEngineService implements OnModuleInit {
       data: { gameId, playerId, turnNumber: state.moveCount, moveType: MoveType.DISCARD, cardData: { auto: true, card: discardedCard as any }, isValid: true },
     });
 
-    const discardMove = { type: 'TIMEOUT_DISCARD', playerId, cardId: discardedCard.id, isAuto: true };
+    const discardMove = { type: 'TIMEOUT_DISCARD', playerId, cardId: discardedCard.id, isAuto: true, ...seventyFiveFields };
     this.socketService.emitToRoom(`game:${gameId}`, 'game:move_played', discardMove);
     await this.socketService.emitPerPlayer(`game:${gameId}`, 'game:state_updated', async (uid) => ({
       lastMove: discardMove,
@@ -2591,8 +2750,54 @@ export class GameEngineService implements OnModuleInit {
       await this.paceAutoMove();
     };
 
-    // 1 — Play new melds from hand (leave at least 1 card to discard).
+    // ── 75-rule gate ────────────────────────────────────────────────────────────
+    // The AI plays this turn on an absent player's behalf, so it is bound by the same
+    // opening requirement they are. It previously pushed melds straight onto the board
+    // without touching seventyFiveRule at all, which both bypassed the rule (a 15-point
+    // opening stuck while the player was away) and left the two phones disagreeing about
+    // that seat's progress.
+    //
+    // Policy: attempt the opening ONLY if what it can lay down this turn actually reaches
+    // the requirement. A short attempt would be rolled straight back at turn end and cost
+    // the absent player +20 every turn, plus a meld that appears and vanishes on both
+    // screens — so when it cannot reach the bar, the AI simply melds nothing and discards.
+    const rule = state.seventyFiveRule?.[playerId];
+    const isPro = state.mode === GameMode.PROFESSIONAL;
+    const openingPending = !!rule?.active && !rule.satisfied;
+
     const newMelds = this.aiFindBestMeldsFromHand(hand, mode);
+    if (openingPending) {
+      // Mirror the loop below exactly — same skip condition, same shrinking hand — so the
+      // decision is made on what will really be played, not an optimistic upper bound.
+      let simHandSize = hand.length;
+      let reachable   = 0;
+      for (const m of newMelds) {
+        if (simHandSize - m.length < 1) continue;
+        if (!validateMeld(m, mode).valid) continue;
+        simHandSize -= m.length;
+        reachable   += m.reduce((s, c) => s + cardValue(c, isPro), 0);
+      }
+      if (reachable < rule!.requirement) return; // no melds, no extensions — just discard
+    }
+
+    /**
+     * Records cards the AI just committed to the board against the 75-rule, exactly like the
+     * blocks in processMove's PLAY_MELD / ADD_TO_MELD do. Must be called BEFORE the cards
+     * leave the hand and land in a meld, since seventyFiveTurnPoints reads the board.
+     */
+    const trackSeventyFive = (cards: Card[]) => {
+      if (!rule?.active || rule.satisfied) return;
+      const priorPts = this.seventyFiveTurnPoints(state, playerId);
+      const newPts   = cards.reduce((s, c) => s + cardValue(c, isPro), 0);
+      if (!rule.pendingCardIds) rule.pendingCardIds = [];
+      rule.pendingCardIds.push(...cards.map(c => c.id));
+      if (priorPts + newPts >= rule.requirement) {
+        rule.satisfied = true;
+        rule.pendingCardIds = [];
+      }
+    };
+
+    // 1 — Play new melds from hand (leave at least 1 card to discard).
     for (const meldCards of newMelds) {
       if (hand.length - meldCards.length < 1) continue;
       const validation = validateMeld(meldCards, mode);
@@ -2603,6 +2808,7 @@ export class GameEngineService implements OnModuleInit {
       const mergeTarget = tryFindMergeTarget(meldCards, type, allMelds, mode);
       const sorted      = sortMeldCards(meldCards, type);
 
+      trackSeventyFive(meldCards);
       meldCards.forEach(c => { const i = hand.findIndex(x => x.id === c.id); if (i >= 0) hand.splice(i, 1); });
 
       let affectedMeldId: string;
@@ -2641,6 +2847,7 @@ export class GameEngineService implements OnModuleInit {
         for (let i = 0; i < hand.length; i++) {
           if (hand.length <= 1) break;
           if (!canAddToMeld(meld, [hand[i]], mode)) continue;
+          trackSeventyFive([hand[i]]);
           const [card]   = hand.splice(i, 1);
           meld.cards     = sortMeldCards([...meld.cards, card], meld.type);
           meld.isCanasta = meld.cards.length >= 7;

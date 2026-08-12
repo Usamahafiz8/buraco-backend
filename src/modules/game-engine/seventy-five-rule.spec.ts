@@ -224,3 +224,217 @@ describe('75-rule — accumulate, cancel, auto-cancel', () => {
     expect((result as any).state.seventyFiveActive).toBe(false);
   });
 });
+
+// ── Opponent-visible state & rollback payloads ────────────────────────────────────────
+// The bugs these cover were all "the two phones disagree": the actor's screen updated and
+// the opponent's did not, because the 75-rule fields were viewer-scoped and the returned
+// card ids never left the actor's payload.
+describe('75-rule — payload seen by the OPPONENT', () => {
+  it('publishes every seat\'s 75-rule state in players[], not just the viewer\'s', async () => {
+    const { service, state } = buildService();
+    state!.seventyFiveRule![P2] = { active: false, requirement: 0, satisfied: true, pendingCardIds: [] };
+
+    // P2's phone asks for its own view — it must still learn P1 is 75-rule active.
+    const opponentView: any = service.buildClientView(state!, P2);
+
+    const p1Row = opponentView.players.find((p: any) => p.id === P1);
+    expect(p1Row.seventyFiveActive).toBe(true);
+    expect(p1Row.seventyFiveRequired).toBe(75);
+    expect(p1Row.seventyFiveSatisfied).toBe(false);
+    expect(p1Row.seventyFiveTurnPoints).toBe(0);
+
+    // ...and the viewer's own row still describes the viewer, not the actor.
+    const p2Row = opponentView.players.find((p: any) => p.id === P2);
+    expect(p2Row.seventyFiveActive).toBe(false);
+    // Root fields stay viewer-scoped for existing clients.
+    expect(opponentView.seventyFiveActive).toBe(false);
+  });
+
+  it('shows the opponent the SAME requirement as the actor after a cancel (0/95 on both)', async () => {
+    const { service, state } = buildService();
+    state!.hands[P1] = [
+      card('HEARTS', '4', 'c1'), card('CLUBS', '4', 'c2'), card('SPADES', '4', 'c3'),
+      card('HEARTS', 'K', 'k1'),
+    ];
+    await service.processMove(GAME_ID, P1, { type: MoveType.PLAY_MELD, cardIds: ['c1', 'c2', 'c3'] });
+    await service.cancelMelds(GAME_ID, P1);
+
+    const actorView: any    = service.buildClientView(state!, P1);
+    const opponentView: any = service.buildClientView(state!, P2);
+    const p1FromActor    = actorView.players.find((p: any) => p.id === P1);
+    const p1FromOpponent = opponentView.players.find((p: any) => p.id === P1);
+
+    expect(p1FromActor.seventyFiveRequired).toBe(95);
+    expect(p1FromOpponent.seventyFiveRequired).toBe(95);
+    expect(p1FromOpponent.seventyFiveTurnPoints).toBe(0);
+    expect(actorView.seventyFiveRequired).toBe(95);
+  });
+
+  it('cancel reports returnedCardIds and the requirement before/after', async () => {
+    const { service, state } = buildService();
+    state!.hands[P1] = [
+      card('HEARTS', '4', 'c1'), card('CLUBS', '4', 'c2'), card('SPADES', '4', 'c3'),
+      card('HEARTS', 'K', 'k1'),
+    ];
+    await service.processMove(GAME_ID, P1, { type: MoveType.PLAY_MELD, cardIds: ['c1', 'c2', 'c3'] });
+
+    const result: any = await service.cancelMelds(GAME_ID, P1);
+
+    expect(result.rollback).toEqual({
+      playerId: P1,
+      returnedCardIds: ['c1', 'c2', 'c3'],
+      seventyFiveRequiredBefore: 75,
+      seventyFiveRequiredAfter: 95,
+      seventyFiveTurnPointsBefore: 15,
+      seventyFiveTurnPointsAfter: 0,
+    });
+  });
+
+  it('auto-cancel on discard reports the same rollback shape', async () => {
+    const { service, state } = buildService();
+    state!.hands[P1] = [
+      card('HEARTS', '4', 'c1'), card('CLUBS', '4', 'c2'), card('SPADES', '4', 'c3'),
+      card('HEARTS', 'K', 'k1'), card('CLUBS', '9', 'k2'),
+    ];
+    await service.processMove(GAME_ID, P1, { type: MoveType.PLAY_MELD, cardIds: ['c1', 'c2', 'c3'] });
+
+    const result: any = await service.processMove(GAME_ID, P1, { type: MoveType.DISCARD, cardIds: ['k1'] });
+
+    expect(result.rollback).toEqual({
+      playerId: P1,
+      returnedCardIds: ['c1', 'c2', 'c3'],
+      seventyFiveRequiredBefore: 75,
+      seventyFiveRequiredAfter: 95,
+      seventyFiveTurnPointsBefore: 15,
+      seventyFiveTurnPointsAfter: 0,
+    });
+    expect(result.result.autoCancelled75).toBe(true);
+    expect(result.result.returnedCardIds).toEqual(['c1', 'c2', 'c3']);
+  });
+
+  it('a discard with no pending attempt carries no rollback', async () => {
+    const { service, state } = buildService();
+    state!.hands[P1] = [card('HEARTS', 'K', 'k1'), card('CLUBS', '9', 'k2')];
+
+    const result: any = await service.processMove(GAME_ID, P1, { type: MoveType.DISCARD, cardIds: ['k1'] });
+
+    expect(result.rollback).toBeNull();
+    expect(result.result.autoCancelled75).toBeUndefined();
+  });
+
+  it('leaves no returned card in ANY meld array of EITHER viewer after rollback', async () => {
+    const { service, state } = buildService();
+    state!.hands[P1] = [
+      card('HEARTS', '4', 'c1'), card('CLUBS', '4', 'c2'), card('SPADES', '4', 'c3'),
+      card('HEARTS', 'K', 'k1'),
+    ];
+    await service.processMove(GAME_ID, P1, { type: MoveType.PLAY_MELD, cardIds: ['c1', 'c2', 'c3'] });
+    const returned = ((await service.cancelMelds(GAME_ID, P1)) as any).rollback.returnedCardIds;
+
+    for (const viewer of [P1, P2]) {
+      const view: any = service.buildClientView(state!, viewer);
+      const meldCardIds = [
+        ...view.players.flatMap((p: any) => p.melds.flatMap((m: any) => m.cards.map((c: any) => c.id))),
+        ...Object.values(view.teamMelds).flatMap((ms: any) => ms.flatMap((m: any) => m.cards.map((c: any) => c.id))),
+        ...view.myMelds.flatMap((m: any) => m.cards.map((c: any) => c.id)),
+      ];
+      for (const id of returned) expect(meldCardIds).not.toContain(id);
+    }
+
+    // The actor's hand count includes them again on BOTH viewers' payloads.
+    for (const viewer of [P1, P2]) {
+      const view: any = service.buildClientView(state!, viewer);
+      expect(view.players.find((p: any) => p.id === P1).handCount).toBe(4);
+    }
+  });
+
+  it('re-rendering the same state never re-applies the +20 penalty', async () => {
+    const { service, state } = buildService();
+    state!.hands[P1] = [
+      card('HEARTS', '4', 'c1'), card('CLUBS', '4', 'c2'), card('SPADES', '4', 'c3'),
+      card('HEARTS', 'K', 'k1'),
+    ];
+    await service.processMove(GAME_ID, P1, { type: MoveType.PLAY_MELD, cardIds: ['c1', 'c2', 'c3'] });
+    await service.cancelMelds(GAME_ID, P1);
+
+    // Every echoed payload is a pure read of the already-updated state.
+    for (let i = 0; i < 5; i++) {
+      const view: any = service.buildClientView(state!, P2);
+      expect(view.players.find((p: any) => p.id === P1).seventyFiveRequired).toBe(95);
+    }
+    expect(state!.seventyFiveRule![P1].requirement).toBe(95);
+
+    // ...and a second cancel with nothing pending is refused rather than charged again.
+    await expect(service.cancelMelds(GAME_ID, P1)).rejects.toThrow(BadRequestException);
+    expect(state!.seventyFiveRule![P1].requirement).toBe(95);
+  });
+});
+
+// ── Turn timer reported during server auto-play ───────────────────────────────────────
+describe('turn timer while the server is auto-playing an absent player', () => {
+  it('still reports the room\'s configured turn duration, not a flat 5s, once a player has been auto-played', () => {
+    const { service, state } = buildService();
+    state!.turnStartedAt = Date.now();
+    state!.consecutiveMissedTurns = { [P1]: 1 }; // P1 already had a turn auto-played
+
+    const view: any = service.buildClientView(state!, P2);
+
+    expect(view.turnDuration).toBe(30);         // the table's own setting, not shortened
+    expect(view.turnDurationBase).toBe(30);     // the room setting, unchanged
+    expect(view.turnFastAutoplay).toBe(false);
+    expect(view.turnEndsAt).toBe(state!.turnStartedAt + 30_000);
+  });
+
+  it('reports the full configured window for a present player', () => {
+    const { service, state } = buildService();
+    state!.turnStartedAt = Date.now();
+    state!.consecutiveMissedTurns = { [P1]: 0 };
+
+    const view: any = service.buildClientView(state!, P2);
+
+    expect(view.turnDuration).toBe(30);
+    expect(view.turnDurationBase).toBe(30);
+    expect(view.turnFastAutoplay).toBe(false);
+    expect(view.turnEndsAt).toBe(state!.turnStartedAt + 30_000);
+  });
+});
+
+// ── AI auto-play is bound by the same rule ────────────────────────────────────────────
+describe('75-rule — server auto-play (AFK) obeys the opening requirement', () => {
+  it('does not open with a below-requirement meld on an absent player\'s behalf', async () => {
+    const { service, state } = buildService();
+    // Three 4s = 15 points, nowhere near 75, plus junk to discard.
+    state!.hands[P1] = [
+      card('HEARTS', '4', 'c1'), card('CLUBS', '4', 'c2'), card('SPADES', '4', 'c3'),
+      card('DIAMONDS', '9', 'x1'), card('HEARTS', '7', 'x2'),
+    ];
+    state!.turnPhase = 'CAN_MELD_OR_DISCARD';
+    state!.consecutiveMissedTurns = { [P1]: 1 }; // arms smart-play
+
+    await service.handleTurnTimeout(GAME_ID);
+
+    expect(state!.melds[P1]).toEqual([]);                       // nothing laid down
+    expect(state!.seventyFiveRule![P1].requirement).toBe(75);    // and so, no penalty
+    expect(state!.seventyFiveRule![P1].pendingCardIds).toEqual([]);
+    expect(state!.seventyFiveRule![P1].satisfied).toBe(false);
+  });
+
+  it('opens and marks the rule satisfied when the AI can actually reach the requirement', async () => {
+    const { service, state } = buildService();
+    // 3 Aces (60) + 3 Kings (30) = 90 >= 75.
+    state!.hands[P1] = [
+      card('HEARTS', 'A', 'a1'), card('CLUBS', 'A', 'a2'), card('SPADES', 'A', 'a3'),
+      card('HEARTS', 'K', 'k1'), card('CLUBS', 'K', 'k2'), card('SPADES', 'K', 'k3'),
+      card('DIAMONDS', '9', 'x1'), card('HEARTS', '7', 'x2'),
+    ];
+    state!.turnPhase = 'CAN_MELD_OR_DISCARD';
+    state!.consecutiveMissedTurns = { [P1]: 1 };
+
+    await service.handleTurnTimeout(GAME_ID);
+
+    expect(state!.melds[P1].length).toBeGreaterThan(0);
+    expect(state!.seventyFiveRule![P1].satisfied).toBe(true);
+    expect(state!.seventyFiveRule![P1].pendingCardIds).toEqual([]);
+    expect(state!.seventyFiveRule![P1].requirement).toBe(75); // met it — no penalty
+  });
+});
