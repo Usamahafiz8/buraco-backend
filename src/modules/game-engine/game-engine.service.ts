@@ -2,6 +2,13 @@ import { BadRequestException, ForbiddenException, Injectable, Logger, NotFoundEx
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { GameHost, GameMode, GameStatus, GameVariant, MoveType, Prisma, RoomStatus } from '@prisma/client';
 
+// Once a player has already missed a turn this match (consecutiveMissedTurns >= 1), the
+// AI takes their NEXT turn over after only this many seconds instead of waiting out the
+// table's full turnDuration — see internalTurnTimeoutSeconds. Applies ONLY to the internal
+// decision of when the server acts; the countdown shown to clients never uses this value
+// (see effectiveTurnSeconds), so a 30s table still visibly reads 30, it just gets acted on
+// early once someone is already mid-AFK-streak.
+const AFK_REPEAT_MISS_TIMEOUT_SECONDS = 5;
 // Forfeit a player after this many FULLY auto-played turns. Counted once per turn
 // (see handleTurnTimeout) and accumulated per-player across the whole match — a new
 // round/hand does NOT reset it; only a manual move by that player clears it.
@@ -306,7 +313,7 @@ export class GameEngineService implements OnModuleInit {
           if (state.turnPhase === 'ROUND_ENDED') return;
 
           const currentPlayerId = state.turnOrder[state.currentTurnIndex];
-          const effectiveTimeout = this.effectiveTurnSeconds(state, currentPlayerId);
+          const effectiveTimeout = this.internalTurnTimeoutSeconds(state, currentPlayerId);
           if (Date.now() - state.turnStartedAt > effectiveTimeout * 1000) {
             // Idempotency lock. This cron runs EVERY_5_SECONDS over ALL games via
             // Promise.all, and @Cron does not prevent a slow run from overlapping the
@@ -570,21 +577,33 @@ export class GameEngineService implements OnModuleInit {
   }
 
   /**
-   * Seconds the CURRENT turn actually lasts before the server auto-plays it.
-   *
-   * Always `state.turnDuration` — the table's own configured turn length — whether the
-   * current player is present or has already had turns auto-played. Previously this
-   * dropped to a flat 5s once a player had missed a turn, regardless of what the table was
-   * set to, which both raced a table's own (possibly longer or shorter) turn length and
-   * made the "AI takes over" countdown appear to reset to a fixed 5s instead of scaling
-   * with the room. An absent player's turns are still timed out on schedule and still climb
-   * toward the 12-turn forfeit — they just do so at the table's own pace, same as anyone
-   * else's turn. Kept as a single definition — used by the cron that fires the timeout, by
-   * markPlayerReconnected, and by the client view — so the number the phones count down is
-   * by construction the same number the server acts on.
+   * Seconds the CURRENT turn is shown counting down from — always `state.turnDuration`,
+   * the table's own configured turn length, no matter what has happened on prior turns.
+   * Feeds ONLY the client-facing view (turnDuration/turnDurationBase/turnFastAutoplay/
+   * turnEndsAt/turnTimeRemaining in buildClientView) — a 30s table always visibly reads 30.
+   * The server's own decision of when it actually acts is a separate number, see
+   * internalTurnTimeoutSeconds; the two used to be the same value, which made the visible
+   * countdown itself snap to 5s whenever a player was mid-AFK-streak.
    */
   private effectiveTurnSeconds(state: GameState, _playerId: string): number {
     return state.turnDuration;
+  }
+
+  /**
+   * Seconds the CURRENT turn actually lasts before the server auto-plays it. This is the
+   * real deadline the timeout cron and a reconnect check act on — deliberately separate
+   * from effectiveTurnSeconds, which only feeds what the client sees.
+   *
+   * A player's first miss of the match still gets the table's full turnDuration. From their
+   * second consecutive miss onward (consecutiveMissedTurns[playerId] >= 1 — already reset to
+   * 0 by any manual move, see processMove, and deliberately left untouched by a bare
+   * reconnect, see markPlayerReconnected) the server acts after only
+   * AFK_REPEAT_MISS_TIMEOUT_SECONDS, e.g. a 30s table counts down to 25 and the AI already
+   * has taken the turn. The visible countdown is untouched either way.
+   */
+  private internalTurnTimeoutSeconds(state: GameState, playerId: string): number {
+    const priorMisses = state.consecutiveMissedTurns?.[playerId] ?? 0;
+    return priorMisses >= 1 ? AFK_REPEAT_MISS_TIMEOUT_SECONDS : state.turnDuration;
   }
 
   /**
@@ -2358,11 +2377,12 @@ export class GameEngineService implements OnModuleInit {
       `consecutiveMissedTurns=${state.consecutiveMissedTurns?.[userId] ?? 0} (this call does not change them)`,
     );
     // If the timer already expired while this player was away and it is still their
-    // turn, give them a fresh full-duration window so the next cron tick does not
-    // immediately auto-play on their behalf. Otherwise leave turnStartedAt untouched
-    // so the remaining time is resumed rather than reset.
+    // turn, give them a fresh window (still governed by internalTurnTimeoutSeconds — a
+    // player already mid-AFK-streak only gets a fresh 5s, not a bonus full turnDuration)
+    // so the next cron tick does not immediately auto-play on their behalf. Otherwise
+    // leave turnStartedAt untouched so the remaining time is resumed rather than reset.
     if (state.status === GameStatus.IN_PROGRESS && state.turnOrder[state.currentTurnIndex] === userId) {
-      const effectiveTimeout = this.effectiveTurnSeconds(state, userId);
+      const effectiveTimeout = this.internalTurnTimeoutSeconds(state, userId);
       const expired = Date.now() - state.turnStartedAt > effectiveTimeout * 1000;
       if (expired) {
         state.turnStartedAt = Date.now();

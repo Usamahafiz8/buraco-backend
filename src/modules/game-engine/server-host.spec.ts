@@ -645,13 +645,53 @@ describe('reconnect vs. reconnect+move — which one actually clears the streak'
   });
 });
 
-// ── Reported bug: the AFK timer used to drop to a flat 5s instead of the table's own
-// configured turn length ───────────────────────────────────────────────────────────────
-describe('turn timeout always waits the table\'s configured duration', () => {
-  it('does NOT auto-play an absent player before turnDuration has elapsed, even after a prior miss', async () => {
+// ── A player's FIRST miss of the match always gets the table's full turnDuration; from
+// their second consecutive miss onward the server acts after only 5s instead — the
+// visible countdown (covered separately in seventy-five-rule.spec.ts) never shortens ────
+describe('turn timeout waits the full table duration on a first miss, but only 5s on a repeat miss', () => {
+  it('does NOT auto-play an absent player before turnDuration has elapsed, on their first miss', async () => {
     const state = gameState({
       turnDuration: 30,
-      turnStartedAt: Date.now() - 10_000, // only 10s in — well under the 30s table setting
+      turnStartedAt: Date.now() - 10_000, // 10s in — past the repeat-miss 5s, well under 30s
+      consecutiveMissedTurns: { [P1]: 0, [P2]: 0 }, // no prior miss yet
+      forfeitMissedTurns: { [P1]: 0, [P2]: 0 },
+      players: [
+        { userId: P1, teamId: 1, isConnected: false },
+        { userId: P2, teamId: 2, isConnected: true },
+      ],
+    });
+    const { service, redis } = buildService({ state });
+    redis.smembers.mockResolvedValue([GAME_ID]);
+
+    await service.checkTurnTimeouts();
+
+    expect(redis.setNx).not.toHaveBeenCalledWith(`game:${GAME_ID}:autoplay`, '1', 15);
+    expect(state.consecutiveMissedTurns![P1]).toBe(0);
+  });
+
+  it('auto-plays once turnDuration has elapsed, matching the table setting exactly, on a first miss', async () => {
+    const state = gameState({
+      turnDuration: 30,
+      turnStartedAt: Date.now() - 31_000, // just past the table's 30s
+      consecutiveMissedTurns: { [P1]: 0, [P2]: 0 },
+      forfeitMissedTurns: { [P1]: 0, [P2]: 0 },
+      players: [
+        { userId: P1, teamId: 1, isConnected: false },
+        { userId: P2, teamId: 2, isConnected: true },
+      ],
+    });
+    const { service, redis } = buildService({ state });
+    redis.smembers.mockResolvedValue([GAME_ID]);
+
+    await service.checkTurnTimeouts();
+
+    expect(redis.setNx).toHaveBeenCalledWith(`game:${GAME_ID}:autoplay`, '1', 15);
+  });
+
+  it('does NOT auto-play a repeat-miss player before the 5s repeat-miss window elapses', async () => {
+    const state = gameState({
+      turnDuration: 30,
+      turnStartedAt: Date.now() - 3_000, // only 3s in — under the 5s repeat-miss trigger
       consecutiveMissedTurns: { [P1]: 1, [P2]: 0 }, // P1 already missed a turn once
       forfeitMissedTurns: { [P1]: 1, [P2]: 0 },
       players: [
@@ -664,17 +704,15 @@ describe('turn timeout always waits the table\'s configured duration', () => {
 
     await service.checkTurnTimeouts();
 
-    // The old 5s fast-autoplay path would have fired here (10s > 5s); the table's own 30s
-    // setting must not have elapsed yet, so nothing should be auto-played.
     expect(redis.setNx).not.toHaveBeenCalledWith(`game:${GAME_ID}:autoplay`, '1', 15);
     expect(state.consecutiveMissedTurns![P1]).toBe(1);
   });
 
-  it('auto-plays once turnDuration has elapsed, matching the table setting exactly', async () => {
+  it('auto-plays a repeat-miss player after only 5s, well before the table\'s 30s would elapse', async () => {
     const state = gameState({
       turnDuration: 30,
-      turnStartedAt: Date.now() - 31_000, // just past the table's 30s
-      consecutiveMissedTurns: { [P1]: 1, [P2]: 0 },
+      turnStartedAt: Date.now() - 6_000, // 6s in — past the 5s repeat-miss trigger, well under 30s
+      consecutiveMissedTurns: { [P1]: 1, [P2]: 0 }, // P1 already missed a turn once
       forfeitMissedTurns: { [P1]: 1, [P2]: 0 },
       players: [
         { userId: P1, teamId: 1, isConnected: false },
@@ -687,5 +725,26 @@ describe('turn timeout always waits the table\'s configured duration', () => {
     await service.checkTurnTimeouts();
 
     expect(redis.setNx).toHaveBeenCalledWith(`game:${GAME_ID}:autoplay`, '1', 15);
+  });
+
+  it('still shows the table\'s full turnDuration to clients even mid-repeat-miss streak', async () => {
+    const state = gameState({
+      turnDuration: 30,
+      turnStartedAt: Date.now() - 6_000,
+      consecutiveMissedTurns: { [P1]: 1, [P2]: 0 },
+      forfeitMissedTurns: { [P1]: 1, [P2]: 0 },
+      players: [
+        { userId: P1, teamId: 1, isConnected: false },
+        { userId: P2, teamId: 2, isConnected: true },
+      ],
+    });
+    const { service } = buildService({ state });
+
+    const view: any = await service.getGameState(GAME_ID, P2);
+
+    expect(view.turnDuration).toBe(30);
+    expect(view.turnDurationBase).toBe(30);
+    expect(view.turnFastAutoplay).toBe(false);
+    expect(view.turnEndsAt).toBe(state.turnStartedAt + 30_000);
   });
 });
