@@ -748,3 +748,49 @@ describe('turn timeout waits the full table duration on a first miss, but only 5
     expect(view.turnEndsAt).toBe(state.turnStartedAt + 30_000);
   });
 });
+
+// Regression coverage for the timeout/AI discard path never re-validating a legal close
+// the way processMove's manual DISCARD does (see the "No pot — validate close" block
+// there: Classic wild, Buraco, and pot-count checks). handleTurnTimeout currently
+// finalizes unconditionally once tryAwardPot comes back null, and pickLegalDiscardIndex
+// currently offers the last card as "legal" whenever a pot pile is non-empty, without
+// checking whether the team actually has a Buraco — so an AFK/timeout run in Professional
+// mode with no Buraco can discard the last card and end the round even though neither a
+// pot pickup nor a close was ever legally available.
+describe('Professional: an illegal last-card discard must not end the round', () => {
+  function card(id: string, rank: any = '5', suit: any = 'CLUBS') {
+    return { id, suit, rank, isWild: rank === 'JOKER' || rank === '2' } as any;
+  }
+
+  it('no Buraco + pot still unclaimed: timeout discarding the last card must NOT finalize the round', async () => {
+    const state = gameState({
+      mode: 'PROFESSIONAL' as any,
+      endMode: 'INDIRECT',
+      makart: false,
+      turnPhase: 'CAN_MELD_OR_DISCARD',
+      hands: { [P1]: [card('h1')], [P2]: [card('h2'), card('h3')] },
+      potPiles: [[card('p1'), card('p2')], []], // a pot is still sitting there, unclaimed
+      potCollectedByTeam: [], // neither team has taken a pot yet
+      melds: { [P1]: [], [P2]: [] }, // team 1 (P1) has NO Buraco
+      consecutiveMissedTurns: { [P1]: 0, [P2]: 0 }, // first miss — no smart play, exercises pickLegalDiscardIndex
+      forfeitMissedTurns: { [P1]: 0, [P2]: 0 },
+      targetScore: 3000,
+    });
+    const { service, socket } = buildService({ state });
+    const finalizeSpy = jest.spyOn(service, 'finalizeGame');
+
+    await service.handleTurnTimeout(GAME_ID);
+
+    // Team 1 has no Buraco, so emptying the hand this way is neither a legal pot pickup
+    // (tryAwardPot's "must have Buraco before first pot" rule) nor a legal close (the same
+    // rule processMove's manual DISCARD enforces) — the round must be left exactly alone.
+    expect(finalizeSpy).not.toHaveBeenCalled();
+    expect(state.status).toBe(GameStatus.IN_PROGRESS);
+    expect(state.round).toBe(1);
+
+    const newRoundEmits = socket.emitPerPlayer.mock.calls.filter((c: any[]) => c[1] === 'game:new_round');
+    expect(newRoundEmits).toHaveLength(0);
+    const gameEnd = socket.emitToRoom.mock.calls.find((c: any[]) => c[1] === 'game:end');
+    expect(gameEnd).toBeUndefined();
+  });
+});

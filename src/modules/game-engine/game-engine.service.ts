@@ -2674,7 +2674,46 @@ export class GameEngineService implements OnModuleInit {
         return { playerId, autoAction: drawnCard ? 'DRAW_THEN_DISCARD' : 'DISCARD', card: discardedCard };
       }
 
-      const playerTeamId = state.players.find(p => p.userId === playerId)?.teamId ?? 1;
+      // No pot — this can only legally end the round by CLOSING. Re-validate exactly like
+      // processMove's manual DISCARD does (Buraco + full required pot count, never a
+      // Classic wild, never Professional Direct). pickLegalDiscardIndex/aiPickDiscardIndex
+      // should already keep us from reaching here illegally, but finalizeGame answers to
+      // this same authority for a human close, so the AI/timeout path must too — otherwise
+      // a stale/foreign discardIdx can still end a round nobody actually won.
+      const playerTeamId  = state.players.find(p => p.userId === playerId)?.teamId ?? 1;
+      const isClassic     = state.mode === GameMode.CLASSIC;
+      const teamPlayerIds = state.players.filter(p => p.teamId === playerTeamId).map(p => p.userId);
+      const teamHasBuraco = teamPlayerIds.some(uid => hasBuraco(state.melds[uid] || []));
+      const teamPotCount  = (state.potCollectedByTeam ?? []).filter(id => id === playerTeamId).length;
+      const requiredPots  = isClassic ? 1 : 2;
+      const legalClose = teamHasBuraco
+        && teamPotCount >= requiredPots
+        && !(isClassic && discardedCard.isWild)
+        && !(state.mode === GameMode.PROFESSIONAL && state.endMode === 'DIRECT');
+
+      if (!legalClose) {
+        // Not a legal close — undo the discard and treat this exactly like "no legal
+        // discard": keep the card in hand, advance the turn, TIMEOUT_ADVANCE.
+        this.logger.warn(
+          `Timeout: last-card discard for ${playerId} was not a legal pot-take or close, ` +
+          `keeping card and advancing turn instead of finalizing`,
+        );
+        state.discardPile.pop();
+        hand.push(discardedCard);
+        state.currentTurnIndex = (state.currentTurnIndex + 1) % state.turnOrder.length;
+        state.turnStartedAt    = Date.now();
+        state.turnPhase        = 'MUST_DRAW';
+        await this.redis.setJson(this.stateKey(gameId), state, 86400);
+        if (!drawnCard || autoCancelRollback) {
+          await this.socketService.emitPerPlayer(`game:${gameId}`, 'game:state_updated', async (uid) => ({
+            lastMove: { type: 'TIMEOUT_ADVANCE', playerId, isAuto: true, ...seventyFiveFields },
+            ...this.buildClientView(state, uid),
+          }));
+        }
+        if (await this.checkAndForfeit(gameId, playerId, state)) return;
+        return { playerId, autoAction: 'ADVANCE_NO_DISCARD' };
+      }
+
       state.moveCount++;
       await this.redis.setJson(this.stateKey(gameId), state, 86400);
       await this.prisma.gameMove.create({
@@ -2718,20 +2757,36 @@ export class GameEngineService implements OnModuleInit {
 
     if (hand.length > 1) return Math.floor(Math.random() * hand.length);
 
-    // hand.length === 1 — discarding it would attempt to close; validate conditions
-    const playerTeamId = state.players.find(p => p.userId === playerId)?.teamId ?? 1;
-    const teamPotCount = (state.potCollectedByTeam ?? []).filter(id => id === playerTeamId).length;
-    const hasPotToAward = teamPotCount < (state.mode === GameMode.CLASSIC ? 1 : 2)
-      && state.potPiles.some(p => p.length > 0);
-    if (hasPotToAward) return 0;
-
-    const card = hand[0];
-    if (state.mode === GameMode.CLASSIC && card.isWild) return -1;
-
+    // hand.length === 1 — discarding it empties the hand, so it's only legal if it either
+    // takes an awardable pot or legally closes the game. Must mirror processMove's manual
+    // DISCARD case (and the tryAwardPot rules it defers to) exactly, or the AI/timeout path
+    // can offer up a "legal" discard that would actually be rejected coming from a player.
+    const isClassic     = state.mode === GameMode.CLASSIC;
+    const playerTeamId  = state.players.find(p => p.userId === playerId)?.teamId ?? 1;
     const teamPlayerIds = state.players.filter(p => p.teamId === playerTeamId).map(p => p.userId);
     const teamHasBuraco = teamPlayerIds.some(uid => hasBuraco(state.melds[uid] || []));
+    const teamPotCount  = (state.potCollectedByTeam ?? []).filter(id => id === playerTeamId).length;
+
+    // Professional Direct: closing by discard is never allowed, full stop — the team must
+    // empty its hand on-the-fly via a meld/add-to-meld instead (same as processMove).
+    if (!isClassic && state.endMode === 'DIRECT') return -1;
+
+    // Would this discard take the (first) pot rather than close the game? Mirrors
+    // tryAwardPot's own DISCARD-path rules: only the first pot (a second pot is
+    // never awarded via discard), and in Professional only once the team already
+    // has a Buraco.
+    const wouldAwardPot = teamPotCount === 0
+      && (isClassic || teamHasBuraco)
+      && state.potPiles.some(p => p.length > 0);
+    if (wouldAwardPot) return 0;
+
+    // No pot to take — this discard would have to legally CLOSE the game instead.
+    const card = hand[0];
+    if (isClassic && card.isWild) return -1;
     if (!teamHasBuraco) return -1;
-    if (teamPotCount === 0) return -1;
+
+    const requiredPots = isClassic ? 1 : 2;
+    if (teamPotCount < requiredPots) return -1;
 
     return 0;
   }
